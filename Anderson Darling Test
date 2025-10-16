@@ -1,0 +1,24 @@
+import pandas as pd
+from scipy.stats import anderson
+from google.colab import files
+
+# Upload Excel file
+uploaded = files.upload()
+
+# Assuming only one file uploaded, get its name
+file_name = next(iter(uploaded))
+
+# Read the uploaded Excel file
+df = pd.read_excel(file_name)
+
+print("Column\tAD Statistic\tSignificance Level\tCritical Value\tNormality")
+for col in df.select_dtypes(include=['float64', 'int64']).columns:
+    data = df[col].dropna()
+    result = anderson(data, dist='norm')
+    statistic = result.statistic
+    # We'll use 5% significance as common threshold
+    significance_level = 5
+    crit_value = result.critical_values[result.significance_level.tolist().index(significance_level)] if significance_level in result.significance_level.tolist() else result.critical_values[2]
+    # Anderson returns no p-value, only stat/critical values
+    normality = "Normal" if statistic < crit_value else "Not normal"
+    print(f"{col}\t{statistic:.4f}\t{significance_level}%\t{crit_value:.4f}\t{normality}")
