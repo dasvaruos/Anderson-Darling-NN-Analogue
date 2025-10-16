@@ -1,0 +1,101 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from scipy.stats import anderson
+class CauchyLoss(nn.Module):
+    def __init__(self, gamma=1.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, input, target):
+        diff = input - target
+        loss = torch.log(1 + (diff / self.gamma) ** 2)
+        return loss.mean()
+
+class TailSensitiveMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dims=[64,32,16], activation='elu'):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev_dim, h))
+            prev_dim = h
+        self.layers = nn.ModuleList(layers)
+        self.output_layer = nn.Linear(prev_dim, 1)
+        if activation == 'relu':
+            self.activation_fn = F.relu
+        elif activation == 'elu':
+            self.activation_fn = F.elu
+        else:
+            raise ValueError("Unsupported activation")
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+            x = self.activation_fn(x)
+        x = self.output_layer(x)
+        x = torch.sigmoid(x)
+        return x
+
+# Step 4: Extract tail-sensitive features from a column
+def extract_tail_features(col):
+    data = col.dropna().values
+    if len(data) < 30:
+        return None
+
+    sorted_data = np.sort(data)
+    n = len(sorted_data)
+    q1, q5, q95, q99 = np.percentile(sorted_data, [1,5,95,99])
+    try:
+        ad_stat = anderson(sorted_data, dist='norm').statistic
+    except:
+        ad_stat = 0.0
+
+    top_k = max(5, int(n*0.05))
+    tail_data = sorted_data[-top_k:]
+    if np.any(tail_data <= 0):
+        hill_est = 0.0
+    else:
+        hill_est = np.mean(np.log(tail_data)) - np.min(np.log(tail_data))
+
+    mean = np.mean(sorted_data)
+    std = np.std(sorted_data)
+    skew = np.mean(((sorted_data-mean)/std)**3) if std > 0 else 0.0
+    kurt = np.mean(((sorted_data-mean)/std)**4) - 3 if std > 0 else 0.0
+
+    feature_vector = np.array([q1, q5, q95, q99, ad_stat, hill_est, skew, kurt], dtype=np.float32)
+    return feature_vector
+
+# Step 5: Predict normality per column from Excel file
+def predict_normality_excel(filepath, model, threshold=0.5):
+    df = pd.read_excel(filepath)
+    results = {}
+    model.eval()
+    with torch.no_grad():
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                features = extract_tail_features(df[col])
+                if features is None:
+                    results[col] = 'Insufficient data'
+                    continue
+                input_tensor = torch.tensor(features).unsqueeze(0)
+                prob = model(input_tensor).item()
+                suggestion = 'Normal' if prob > threshold else 'Not Normal'
+                results[col] = {'Probability Normality': prob, 'Suggestion': suggestion}
+            else:
+                results[col] = 'Non-numeric column'
+    return results
+
+# Step 6: Instantiate model
+input_dim = 8  # Number of tail-sensitive features
+model = TailSensitiveMLP(input_dim=input_dim, hidden_dims=[64,32,16], activation='elu')
+
+file_path=r"C:\Users\Dell\OneDrive\Desktop\Blogs\Anderson Darling\Vol Data.xlsx"
+
+if file_path:
+    results = predict_normality_excel(file_path, model)
+    for col, res in results.items():
+        print(f"Column: {col} -> Result: {res}")
+else:
+    print("No file selected.")
