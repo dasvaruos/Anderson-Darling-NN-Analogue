@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from scipy.stats import anderson
+
+# Cauchy loss definition
+class CauchyLoss(nn.Module):
+    def __init__(self, gamma=1.0):
+        super().__init__()
+        self.gamma = gamma
+    def forward(self, input, target):
+        diff = input - target
+        loss = torch.log(1 + (diff/self.gamma) ** 2)
+        return loss.mean()
+
+# Auxiliary tail network architecture
+class AuxTailMLP(nn.Module):
+    def __init__(self, input_dim_main, input_dim_tail,
+                 main_hidden=[32,16], tail_hidden=[8], fusion_hidden=[16],
+                 activation='elu'):
+        super().__init__()
+        # Main branch
+        main_layers = []
+        prev = input_dim_main
+        for h in main_hidden:
+            main_layers.append(nn.Linear(prev, h))
+            prev = h
+        self.main_net = nn.Sequential(*main_layers)
+        # Lower tail branch
+        tailL_layers = []
+        prev = input_dim_tail
+        for h in tail_hidden:
+            tailL_layers.append(nn.Linear(prev, h))
+            prev = h
+        self.lower_tail_net = nn.Sequential(*tailL_layers)
+        # Upper tail branch
+        tailU_layers = []
+        prev = input_dim_tail
+        for h in tail_hidden:
+            tailU_layers.append(nn.Linear(prev, h))
+            prev = h
+        self.upper_tail_net = nn.Sequential(*tailU_layers)
+        # Fusion
+        fusion_in = main_hidden[-1] + 2*tail_hidden[-1]
+        fusion_layers = []
+        prev = fusion_in
+        for h in fusion_hidden:
+            fusion_layers.append(nn.Linear(prev, h))
+            prev = h
+        self.fusion_net = nn.Sequential(*fusion_layers)
+        self.output = nn.Linear(fusion_hidden[-1], 1)
+        self.act = F.elu if activation=='elu' else F.relu
+
+    def forward(self, x_main, x_tailL, x_tailU):
+        x1 = x_main
+        for layer in self.main_net:
+            x1 = self.act(layer(x1))
+        x2 = x_tailL
+        for layer in self.lower_tail_net:
+            x2 = self.act(layer(x2))
+        x3 = x_tailU
+        for layer in self.upper_tail_net:
+            x3 = self.act(layer(x3))
+        x = torch.cat([x1, x2, x3], dim=1)
+        for layer in self.fusion_net:
+            x = self.act(layer(x))
+        x = torch.sigmoid(self.output(x))
+        return x
+
+# Feature engineering functions
+def extract_features(data):
+    arr = data.dropna().values
+    if len(arr) < 30:
+        return None, None, None
+    arr_sorted = np.sort(arr)
+    n = len(arr_sorted)
+    mean = np.mean(arr_sorted)
+    std = np.std(arr_sorted)
+    skew = np.mean(((arr_sorted-mean)/std)**3) if std > 0 else 0.0
+    kurt = np.mean(((arr_sorted-mean)/std)**4) - 3 if std > 0 else 0.0
+    ad = anderson(arr_sorted, dist='norm').statistic
+    q05, q25, q75, q95 = np.percentile(arr_sorted, [5,25,75,95])
+    main_features = np.array([mean, std, skew, kurt, ad, q25, q75], dtype=np.float32) 
+
+    lower_tail = arr_sorted[arr_sorted <= q05]
+    upper_tail = arr_sorted[arr_sorted >= q95]
+    def tail_features(tail):
+        if len(tail) > 0:
+            return np.array([
+                np.min(tail), np.max(tail), np.mean(tail),
+                np.std(tail), len(tail)/len(arr_sorted)
+            ], dtype=np.float32)
+        return np.zeros(5, dtype=np.float32)
+    lower_tail_feats = tail_features(lower_tail)
+    upper_tail_feats = tail_features(upper_tail)
+    return main_features, lower_tail_feats, upper_tail_feats
+
+# Prediction function for column-wise normality
+def predict_aux_tail_from_excel(filepath, model, threshold=0.5):
+    df = pd.read_excel(filepath)
+    results = {}
+    model.eval()
+    with torch.no_grad():
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                feats = extract_features(df[col])
+                if any(f is None for f in feats):  # Corrected check here
+                    results[col] = 'Insufficient data'
+                    continue
+                x_main = torch.tensor(feats[0]).unsqueeze(0)
+                x_tailL = torch.tensor(feats[1]).unsqueeze(0)
+                x_tailU = torch.tensor(feats[2]).unsqueeze(0)
+                prob = model(x_main, x_tailL, x_tailU).item()
+                suggestion = 'Normal' if prob > threshold else 'Not Normal'
+                results[col] = {'Probability Normality': prob, 'Suggestion': suggestion}
+            else:
+                results[col] = 'Non-numeric column'
+    return results
+
+# Instantiate model
+input_main = 7
+input_tail = 5
+model = AuxTailMLP(input_dim_main=input_main, input_dim_tail=input_tail,
+                   main_hidden=[32,16], tail_hidden=[8], fusion_hidden=[16])
+
+# Specify excel file path here (update path accordingly)
+file_path=r"C:\Users\Dell\OneDrive\Desktop\Blogs\Currency Data.xlsx"
+
+# Run prediction and print results
+results = predict_aux_tail_from_excel(file_path, model)
+for col, res in results.items():
+    print(f"Column: {col} -> Result: {res}")
