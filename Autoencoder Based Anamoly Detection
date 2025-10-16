@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+from sklearn.preprocessing import StandardScaler
+
+# Cauchy loss for reconstruction with optional weights
+class WeightedCauchyLoss(nn.Module):
+    def __init__(self, gamma=1.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, input, target, weights=None):
+        diff = input - target
+        loss_matrix = torch.log(1 + (diff/self.gamma)**2)
+        if weights is not None:
+            weighted_loss = loss_matrix * weights
+            return weighted_loss.mean()
+        else:
+            return loss_matrix.mean()
+
+# Simple fully connected autoencoder
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=16, latent_dim=8):
+        super().__init__()
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU()
+        )
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_recon = self.decoder(z)
+        return x_recon
+
+def weighted_cauchy_loss(output, target, gamma=1.0, weights=None):
+    diff = output - target
+    loss_matrix = torch.log(1 + (diff/gamma)**2)
+    if weights is not None:
+        weighted_loss = loss_matrix * weights
+        return weighted_loss.mean()
+    else:
+        return loss_matrix.mean()
+
+# Extract features from 1D data column for training/testing: raw standardized data
+def prepare_data(column, quantile_low=0.1, quantile_high=0.9):
+    arr = column.dropna().values.reshape(-1,1)
+    if len(arr) < 30:
+        return None,None,None,None
+    scaler = StandardScaler()
+    arr_scaled = scaler.fit_transform(arr)
+    q_low = np.quantile(arr_scaled, quantile_low)
+    q_high = np.quantile(arr_scaled, quantile_high)
+    # Select central training data (mostly normal)
+    idx_train = np.where((arr_scaled >= q_low) & (arr_scaled <= q_high))[0]
+    idx_test = np.arange(len(arr_scaled))  # test on all
+    # Weight vector emphasizing tails more heavily, e.g. top/bottom 10%
+    weights = np.ones(len(arr_scaled))
+    tail_idx = np.where((arr_scaled[:,0]<q_low) | (arr_scaled[:,0]>q_high))[0]
+    weights[tail_idx] = 5.0  # tail points weighted 5x more error
+    return arr_scaled, idx_train, idx_test, weights
+
+def train_autoencoder(model, data, train_indices, weights, epochs=150, lr=1e-3):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_func = WeightedCauchyLoss(gamma=1.0)
+    model.train()
+    X_train = torch.tensor(data[train_indices], dtype=torch.float32)
+    W_train = torch.tensor(weights[train_indices], dtype=torch.float32).unsqueeze(1)
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        outputs = model(X_train)
+        loss = loss_func(outputs, X_train, W_train)
+        loss.backward()
+        optimizer.step()
+
+def evaluate_autoencoder(model, data, weights):
+    model.eval()
+    X = torch.tensor(data, dtype=torch.float32)
+    with torch.no_grad():
+        recon = model(X)
+        errors = torch.log(1 + ((recon - X)/1.0)**2).mean(dim=1).numpy()
+    # Weighted average per point emphasizing tails is embedded in training, we look at errors now
+    # Threshold can be mean+3*std for reconstruction error for "normality"
+    thresh = np.mean(errors) + 3*np.std(errors)
+    normality_suggestion = "Normal" if np.mean(errors) < thresh else "Not Normal"
+    return np.mean(errors), normality_suggestion
+
+def normality_test_from_excel(file_path):
+    df = pd.read_excel(file_path)
+    results = {}
+
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            data, idx_train, idx_test, weights = prepare_data(df[col])
+            if data is None:
+                results[col] = 'Insufficient data'
+                continue
+            model = Autoencoder(input_dim=1)
+            train_autoencoder(model, data, idx_train, weights)
+            mean_err, suggestion = evaluate_autoencoder(model, data, weights)
+            results[col] = {'Mean Reconstruction Error': mean_err, 'Suggestion': suggestion}
+        else:
+            results[col] = 'Non-numeric column'
+    return results
+
+# Specify your Excel file path here
+excel_file_path = r"C:\Users\Dell\OneDrive\Desktop\Blogs\Anderson Darling\Vol Data.xlsx"
+
+results = normality_test_from_excel(excel_file_path)
+for col, res in results.items():
+    print(f"Column: {col}, Result: {res}")
